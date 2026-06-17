@@ -1,12 +1,13 @@
-const express = require("express");
-const cors = require("cors");
-const Razorpay = require("razorpay");
+const express   = require("express");
+const cors      = require("cors");
+const Razorpay  = require("razorpay");
 const { v4: uuidv4 } = require("uuid");
-const crypto = require("crypto");
+const crypto    = require("crypto");
 const rateLimit = require("express-rate-limit");
-const helmet = require("helmet");
-const admin = require("firebase-admin");
+const helmet    = require("helmet");
+const admin     = require("firebase-admin");
 
+// ── Firebase Admin ────────────────────────────────────────────────────────────
 let db = null;
 try {
   if (!admin.apps.length) {
@@ -17,30 +18,51 @@ try {
     });
   }
   db = admin.firestore();
+  console.log("Firebase Admin initialised");
 } catch (err) {
   console.error("Firebase Admin init failed:", err.message);
 }
 
-// ── Express setup ────────────────────────────────────────────────────────────
+// ── Express ───────────────────────────────────────────────────────────────────
 const app = express();
-app.use(helmet());
 
-const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
-  : ["https://app.mlmlive.in", "http://10.52.22.157:5173/", "http://localhost:5173/"];
+// helmet — but disable contentSecurityPolicy so browser JS calls work fine
+app.use(helmet({ contentSecurityPolicy: false }));
 
-app.use(
-  cors({
-    origin: allowedOrigins,
-    methods: ["POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "X-Api-Key", "Authorization"],
-    optionsSuccessStatus: 204,
-  }),
-);
+// ── CORS ──────────────────────────────────────────────────────────────────────
+// Read comma-separated origins from env, e.g.:
+//   ALLOWED_ORIGINS=https://app.mlmlive.in,https://www.mlmlive.in
+//
+// If not set, ALL origins are blocked by default (safe for a pure API server).
+// Set ALLOWED_ORIGINS=* in Vercel only during debugging — remove for production.
+const rawOrigins = (process.env.ALLOWED_ORIGINS || "").split(",").map((o) => o.trim()).filter(Boolean);
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no Origin header (Postman, curl, server-to-server)
+    if (!origin) return callback(null, true);
+
+    // Wildcard — allow everything (use only for debugging)
+    if (rawOrigins.includes("*")) return callback(null, true);
+
+    if (rawOrigins.includes(origin)) return callback(null, true);
+
+    console.warn("CORS blocked origin:", origin);
+    callback(new Error("Not allowed by CORS: " + origin));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "X-Api-Key", "Authorization"],
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+
+// Handle preflight for every route
+app.options("*", cors(corsOptions));
 
 app.use(express.json({ limit: "10kb" }));
 
-// ── Rate limiters ────────────────────────────────────────────────────────────
+// ── Rate limiters ─────────────────────────────────────────────────────────────
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 60,
@@ -50,31 +72,27 @@ const globalLimiter = rateLimit({
 });
 app.use(globalLimiter);
 
-// Tighter limiter specifically for coupon validation (prevents brute-force)
 const couponLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
-  message: {
-    success: false,
-    error: "Too many coupon attempts. Try again in 15 minutes.",
-  },
+  message: { success: false, error: "Too many coupon attempts. Try again in 15 minutes." },
 });
 
-// ── Razorpay ─────────────────────────────────────────────────────────────────
+// ── Razorpay ──────────────────────────────────────────────────────────────────
 const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
+  key_id:     process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
 const MIN_AMOUNT_INR = 1;
-const MAX_AMOUNT_INR = 5000;
+const MAX_AMOUNT_INR = 50000;
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 const getApiKey = (req) => {
-  const fromHeader = req.headers["x-api-key"];
-  if (fromHeader) return fromHeader.trim();
+  const h = req.headers["x-api-key"];
+  if (h) return h.trim();
   const auth = req.headers["authorization"] || "";
   if (auth.startsWith("Bearer ")) return auth.slice(7).trim();
   return null;
@@ -82,38 +100,36 @@ const getApiKey = (req) => {
 
 const isValidApiKey = (key) => {
   if (!key) return false;
-  const validKeys = (process.env.VALID_API_KEYS || "")
-    .split(",")
-    .map((k) => k.trim())
-    .filter(Boolean);
-  return validKeys.includes(key);
+  const valid = (process.env.VALID_API_KEYS || "")
+    .split(",").map((k) => k.trim()).filter(Boolean);
+  return valid.includes(key);
 };
 
 const requireApiKey = (req, res, next) => {
-  const apiKey = getApiKey(req);
-  if (!isValidApiKey(apiKey)) {
+  if (!isValidApiKey(getApiKey(req))) {
     return res.status(403).json({ success: false, error: "Forbidden" });
   }
   next();
 };
 
-// ── Routes ───────────────────────────────────────────────────────────────────
+// ── Routes ────────────────────────────────────────────────────────────────────
+
+// Health check — GET (no auth needed, confirms server is alive)
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
-app.get("/", (req, res) => {
-  res.json({ status: "ok", message: " Service is running" });
-});
-// Create Razorpay order
+
+// Root GET — confirms routing works (no auth needed)
+app.get("/", (_req, res) =>
+  res.json({ status: "ok", message: "Payment service is running" })
+);
+
+// ── POST / — Create Razorpay order ───────────────────────────────────────────
 app.post("/", requireApiKey, async (req, res) => {
   try {
     const rawAmount = req.body?.amount;
     const amount = Number(rawAmount);
-    if (
-      rawAmount === undefined ||
-      rawAmount === null ||
-      isNaN(amount) ||
-      amount < MIN_AMOUNT_INR ||
-      amount > MAX_AMOUNT_INR
-    ) {
+
+    if (rawAmount === undefined || rawAmount === null ||
+        isNaN(amount) || amount < MIN_AMOUNT_INR || amount > MAX_AMOUNT_INR) {
       return res.status(400).json({
         success: false,
         error: `Amount must be between ₹${MIN_AMOUNT_INR} and ₹${MAX_AMOUNT_INR}`,
@@ -121,163 +137,106 @@ app.post("/", requireApiKey, async (req, res) => {
     }
 
     const order = await razorpay.orders.create({
-      amount: Math.round(amount * 100),
+      amount:   Math.round(amount * 100),
       currency: "INR",
-      receipt: uuidv4(),
+      receipt:  uuidv4(),
     });
 
     return res.status(200).json({
-      success: true,
+      success:  true,
       order_id: order.id,
-      amount: order.amount,
+      amount:   order.amount,
       currency: order.currency,
     });
-  } catch (error) {
-    console.error("Order creation failed:", error.message);
-    return res
-      .status(500)
-      .json({ success: false, error: "Order creation failed" });
+  } catch (err) {
+    console.error("Order creation failed:", err.message);
+    return res.status(500).json({ success: false, error: "Order creation failed" });
   }
 });
 
-// Verify Razorpay payment signature
+// ── POST /verify-payment — Verify Razorpay signature ─────────────────────────
 app.post("/verify-payment", requireApiKey, (req, res) => {
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } =
-      req.body || {};
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
 
-    if (
-      !razorpay_order_id ||
-      !razorpay_payment_id ||
-      !razorpay_signature ||
-      typeof razorpay_order_id !== "string" ||
-      typeof razorpay_payment_id !== "string" ||
-      typeof razorpay_signature !== "string"
-    ) {
-      return res
-        .status(400)
-        .json({ success: false, error: "Missing or invalid payment fields" });
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature ||
+        typeof razorpay_order_id   !== "string" ||
+        typeof razorpay_payment_id !== "string" ||
+        typeof razorpay_signature  !== "string") {
+      return res.status(400).json({ success: false, error: "Missing or invalid payment fields" });
     }
 
-    const payload = `${razorpay_order_id}|${razorpay_payment_id}`;
-    const expectedSig = crypto
+    const expected = crypto
       .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-      .update(payload)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
       .digest("hex");
 
     let isValid = false;
     try {
-      const receivedBuf = Buffer.from(razorpay_signature, "hex");
-      const expectedBuf = Buffer.from(expectedSig, "hex");
-      isValid =
-        receivedBuf.length === expectedBuf.length &&
-        crypto.timingSafeEqual(receivedBuf, expectedBuf);
-    } catch {
-      isValid = false;
-    }
+      const a = Buffer.from(razorpay_signature, "hex");
+      const b = Buffer.from(expected, "hex");
+      isValid = a.length === b.length && crypto.timingSafeEqual(a, b);
+    } catch { isValid = false; }
 
     if (!isValid) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          error: "Payment signature verification failed",
-        });
+      return res.status(400).json({ success: false, error: "Payment signature verification failed" });
     }
 
     return res.status(200).json({ success: true, verified: true });
-  } catch (error) {
-    console.error("Verify payment error:", error.message);
-    return res
-      .status(500)
-      .json({ success: false, error: "Verification error" });
+  } catch (err) {
+    console.error("Verify payment error:", err.message);
+    return res.status(500).json({ success: false, error: "Verification error" });
   }
 });
 
-// ── Coupon validation (server-side, never exposed to browser) ────────────────
-//
-// POST /validate-coupon
-// Headers: X-Api-Key: <key>
-// Body:    { "code": "ABC123" }
-//
-// Response (valid):   { success: true, valid: true, discountPercent: 20 }
-// Response (invalid): { success: true, valid: false, reason: "not_found" | "inactive" }
-// Response (error):   { success: false, error: "..." }
-//
+// ── POST /validate-coupon — Server-side coupon validation ─────────────────────
 app.post("/validate-coupon", requireApiKey, couponLimiter, async (req, res) => {
   if (!db) {
-    return res
-      .status(503)
-      .json({ success: false, error: "Coupon service unavailable" });
+    return res.status(503).json({ success: false, error: "Coupon service unavailable" });
   }
 
   const rawCode = req.body?.code;
-
-  // Validate code format before hitting Firestore
   if (typeof rawCode !== "string") {
-    return res
-      .status(400)
-      .json({ success: false, error: "code must be a string" });
+    return res.status(400).json({ success: false, error: "code must be a string" });
   }
+
   const code = rawCode.toUpperCase().replace(/[^A-Z0-9]/g, "");
   if (code.length !== 6) {
-    return res
-      .status(400)
-      .json({
-        success: false,
-        error: "Coupon code must be exactly 6 alphanumeric characters",
-      });
+    return res.status(400).json({
+      success: false,
+      error: "Coupon code must be exactly 6 alphanumeric characters",
+    });
   }
 
   try {
-    const snap = await db
-      .collection("couponcode")
-      .where("code", "==", code)
-      .limit(1)
-      .get();
+    const snap = await db.collection("couponcode").where("code", "==", code).limit(1).get();
 
     if (snap.empty) {
-      return res
-        .status(200)
-        .json({ success: true, valid: false, reason: "not_found" });
+      return res.status(200).json({ success: true, valid: false, reason: "not_found" });
     }
 
     const data = snap.docs[0].data();
 
     if (data.active === false) {
-      return res
-        .status(200)
-        .json({ success: true, valid: false, reason: "inactive" });
+      return res.status(200).json({ success: true, valid: false, reason: "inactive" });
     }
 
     const discountPercent = Number(data.user_discount ?? 0);
-    if (
-      isNaN(discountPercent) ||
-      discountPercent < 0 ||
-      discountPercent > 100
-    ) {
-      return res
-        .status(200)
-        .json({ success: true, valid: false, reason: "invalid_discount" });
+    if (isNaN(discountPercent) || discountPercent < 0 || discountPercent > 100) {
+      return res.status(200).json({ success: true, valid: false, reason: "invalid_discount" });
     }
 
-    return res.status(200).json({
-      success: true,
-      valid: true,
-      discountPercent,
-    });
+    return res.status(200).json({ success: true, valid: true, discountPercent });
   } catch (err) {
     console.error("Coupon validation error:", err.message);
-    return res
-      .status(500)
-      .json({ success: false, error: "Coupon validation failed" });
+    return res.status(500).json({ success: false, error: "Coupon validation failed" });
   }
 });
 
-app.use((_req, res) =>
-  res.status(404).json({ success: false, error: "Not found" }),
-);
+// 404 fallback
+app.use((_req, res) => res.status(404).json({ success: false, error: "Not found" }));
 
+// ── Start (local dev only; Vercel ignores this) ───────────────────────────────
 if (require.main === module) {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
