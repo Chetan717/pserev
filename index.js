@@ -1,11 +1,11 @@
-const express   = require("express");
-const cors      = require("cors");
-const Razorpay  = require("razorpay");
+const express = require("express");
+const cors = require("cors");
+const Razorpay = require("razorpay");
 const { v4: uuidv4 } = require("uuid");
-const crypto    = require("crypto");
+const crypto = require("crypto");
 const rateLimit = require("express-rate-limit");
-const helmet    = require("helmet");
-const admin     = require("firebase-admin");
+const helmet = require("helmet");
+const admin = require("firebase-admin");
 
 let db = null;
 try {
@@ -27,14 +27,20 @@ app.use(helmet());
 
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
-  : ["https://app.mlmlive.in", "http://10.52.22.157:5173/", "http://localhost:5173/"];
+  : [
+      "https://app.mlmlive.in",
+      "http://10.52.22.157:5173/",
+      "http://localhost:5173/",
+    ];
 
-app.use(cors({
-  origin: allowedOrigins,
-  methods: ["POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "X-Api-Key", "Authorization"],
-  optionsSuccessStatus: 204,
-}));
+app.use(
+  cors({
+    origin: allowedOrigins,
+    methods: ["POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "X-Api-Key", "Authorization"],
+    optionsSuccessStatus: 204,
+  }),
+);
 
 app.use(express.json({ limit: "10kb" }));
 
@@ -54,12 +60,15 @@ const couponLimiter = rateLimit({
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { success: false, error: "Too many coupon attempts. Try again in 15 minutes." },
+  message: {
+    success: false,
+    error: "Too many coupon attempts. Try again in 15 minutes.",
+  },
 });
 
 // ── Razorpay ─────────────────────────────────────────────────────────────────
 const razorpay = new Razorpay({
-  key_id:     process.env.RAZORPAY_KEY_ID,
+  key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
@@ -78,7 +87,9 @@ const getApiKey = (req) => {
 const isValidApiKey = (key) => {
   if (!key) return false;
   const validKeys = (process.env.VALID_API_KEYS || "")
-    .split(",").map((k) => k.trim()).filter(Boolean);
+    .split(",")
+    .map((k) => k.trim())
+    .filter(Boolean);
   return validKeys.includes(key);
 };
 
@@ -92,14 +103,21 @@ const requireApiKey = (req, res, next) => {
 
 // ── Routes ───────────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
-
+app.get("/", (req, res) => {
+  res.json({ status: "ok", message: " Service is running" });
+});
 // Create Razorpay order
 app.post("/", requireApiKey, async (req, res) => {
   try {
     const rawAmount = req.body?.amount;
     const amount = Number(rawAmount);
-    if (rawAmount === undefined || rawAmount === null || isNaN(amount) ||
-        amount < MIN_AMOUNT_INR || amount > MAX_AMOUNT_INR) {
+    if (
+      rawAmount === undefined ||
+      rawAmount === null ||
+      isNaN(amount) ||
+      amount < MIN_AMOUNT_INR ||
+      amount > MAX_AMOUNT_INR
+    ) {
       return res.status(400).json({
         success: false,
         error: `Amount must be between ₹${MIN_AMOUNT_INR} and ₹${MAX_AMOUNT_INR}`,
@@ -113,27 +131,36 @@ app.post("/", requireApiKey, async (req, res) => {
     });
 
     return res.status(200).json({
-      success:   true,
-      order_id:  order.id,
-      amount:    order.amount,
-      currency:  order.currency,
+      success: true,
+      order_id: order.id,
+      amount: order.amount,
+      currency: order.currency,
     });
   } catch (error) {
     console.error("Order creation failed:", error.message);
-    return res.status(500).json({ success: false, error: "Order creation failed" });
+    return res
+      .status(500)
+      .json({ success: false, error: "Order creation failed" });
   }
 });
 
 // Verify Razorpay payment signature
 app.post("/verify-payment", requireApiKey, (req, res) => {
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } =
+      req.body || {};
 
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature ||
-        typeof razorpay_order_id   !== "string" ||
-        typeof razorpay_payment_id !== "string" ||
-        typeof razorpay_signature  !== "string") {
-      return res.status(400).json({ success: false, error: "Missing or invalid payment fields" });
+    if (
+      !razorpay_order_id ||
+      !razorpay_payment_id ||
+      !razorpay_signature ||
+      typeof razorpay_order_id !== "string" ||
+      typeof razorpay_payment_id !== "string" ||
+      typeof razorpay_signature !== "string"
+    ) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Missing or invalid payment fields" });
     }
 
     const payload = `${razorpay_order_id}|${razorpay_payment_id}`;
@@ -149,16 +176,25 @@ app.post("/verify-payment", requireApiKey, (req, res) => {
       isValid =
         receivedBuf.length === expectedBuf.length &&
         crypto.timingSafeEqual(receivedBuf, expectedBuf);
-    } catch { isValid = false; }
+    } catch {
+      isValid = false;
+    }
 
     if (!isValid) {
-      return res.status(400).json({ success: false, error: "Payment signature verification failed" });
+      return res
+        .status(400)
+        .json({
+          success: false,
+          error: "Payment signature verification failed",
+        });
     }
 
     return res.status(200).json({ success: true, verified: true });
   } catch (error) {
     console.error("Verify payment error:", error.message);
-    return res.status(500).json({ success: false, error: "Verification error" });
+    return res
+      .status(500)
+      .json({ success: false, error: "Verification error" });
   }
 });
 
@@ -174,18 +210,27 @@ app.post("/verify-payment", requireApiKey, (req, res) => {
 //
 app.post("/validate-coupon", requireApiKey, couponLimiter, async (req, res) => {
   if (!db) {
-    return res.status(503).json({ success: false, error: "Coupon service unavailable" });
+    return res
+      .status(503)
+      .json({ success: false, error: "Coupon service unavailable" });
   }
 
   const rawCode = req.body?.code;
 
   // Validate code format before hitting Firestore
   if (typeof rawCode !== "string") {
-    return res.status(400).json({ success: false, error: "code must be a string" });
+    return res
+      .status(400)
+      .json({ success: false, error: "code must be a string" });
   }
   const code = rawCode.toUpperCase().replace(/[^A-Z0-9]/g, "");
   if (code.length !== 6) {
-    return res.status(400).json({ success: false, error: "Coupon code must be exactly 6 alphanumeric characters" });
+    return res
+      .status(400)
+      .json({
+        success: false,
+        error: "Coupon code must be exactly 6 alphanumeric characters",
+      });
   }
 
   try {
@@ -196,32 +241,46 @@ app.post("/validate-coupon", requireApiKey, couponLimiter, async (req, res) => {
       .get();
 
     if (snap.empty) {
-      return res.status(200).json({ success: true, valid: false, reason: "not_found" });
+      return res
+        .status(200)
+        .json({ success: true, valid: false, reason: "not_found" });
     }
 
     const data = snap.docs[0].data();
 
     if (data.active === false) {
-      return res.status(200).json({ success: true, valid: false, reason: "inactive" });
+      return res
+        .status(200)
+        .json({ success: true, valid: false, reason: "inactive" });
     }
 
     const discountPercent = Number(data.user_discount ?? 0);
-    if (isNaN(discountPercent) || discountPercent < 0 || discountPercent > 100) {
-      return res.status(200).json({ success: true, valid: false, reason: "invalid_discount" });
+    if (
+      isNaN(discountPercent) ||
+      discountPercent < 0 ||
+      discountPercent > 100
+    ) {
+      return res
+        .status(200)
+        .json({ success: true, valid: false, reason: "invalid_discount" });
     }
 
     return res.status(200).json({
-      success:         true,
-      valid:           true,
+      success: true,
+      valid: true,
       discountPercent,
     });
   } catch (err) {
     console.error("Coupon validation error:", err.message);
-    return res.status(500).json({ success: false, error: "Coupon validation failed" });
+    return res
+      .status(500)
+      .json({ success: false, error: "Coupon validation failed" });
   }
 });
 
-app.use((_req, res) => res.status(404).json({ success: false, error: "Not found" }));
+app.use((_req, res) =>
+  res.status(404).json({ success: false, error: "Not found" }),
+);
 
 if (require.main === module) {
   const PORT = process.env.PORT || 3000;
