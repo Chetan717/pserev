@@ -460,7 +460,7 @@ const razorpay = new Razorpay({
 });
 
 const MIN_AMOUNT_INR = 1;
-const MAX_AMOUNT_INR = 500000;
+const MAX_AMOUNT_INR = 5000;
 
 // ── Collection names (match your Firestore) ───────────────────────────────────
 // Plans live as an array inside each company document in the mlmcomp collection:
